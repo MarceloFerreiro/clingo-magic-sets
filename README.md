@@ -1,69 +1,66 @@
+**English** | [Español](README.es.md)
+
 # clingo-magic-sets
 
-Transformador **Dynamic Magic Sets (DMS)** para [Clingo](https://potassco.org/clingo/).
+**Dynamic Magic Sets (DMS)** transformer for [Clingo](https://potassco.org/clingo/).
 
-`dms.py` reescribe un programa ASP anotado con directivas `#magic pred/n` y
-produce un programa equivalente que restringe el *grounding* (la eliminación de
-variables) de los predicados ocultos seleccionados a los átomos relevantes para
-la consulta implícita. Clingo no soporta Magic Sets de forma nativa; esta
-herramienta lo aporta como preprocesador externo, operando sobre el AST
-(*Abstract Syntax Tree*) de Clingo a través de su API de Python.
+`dms.py` rewrites an ASP program annotated with `#magic pred/n` directives into an
+equivalent program that restricts the *grounding* (variable elimination) of the
+selected hidden predicates to the atoms relevant to the implicit query. Clingo
+does not support Magic Sets natively; this tool provides them as an external
+preprocessor, operating on Clingo's AST (Abstract Syntax Tree) through its Python
+API.
 
-El algoritmo implementado es el **Dynamic Magic Sets** de Alviano, Faber, Greco
-y Leone para Datalog disyuntivo con negación estratificada (véase
-[Referencias](#referencias)). Los algoritmos no son objeto de copyright; este
-repositorio contiene una **implementación propia** de ese algoritmo para Clingo,
-desarrollada como Trabajo Fin de Grao (Grao en Intelixencia Artificial,
-Universidade da Coruña).
+This is an implementation of the Dynamic Magic Sets algorithm by Alviano, Faber,
+Greco and Leone (see [References](#references)), developed as part of a *Traballo
+Fin de Grao* (Grao en Intelixencia Artificial, Universidade da Coruña).
 
-## Requisitos
+## Requirements
 
 - Python ≥ 3.9
-- [clingo](https://pypi.org/project/clingo/) (paquete Python de la API de Clingo)
+- [clingo](https://pypi.org/project/clingo/) (the Clingo Python API package)
 
 ```bash
 pip install -r requirements.txt
 ```
 
-## Uso
+## Usage
 
 ```bash
-python dms.py entrada.lp [salida.lp]
+python dms.py input.lp [output.lp]
 ```
 
-Si no se indica fichero de salida, el programa transformado se escribe por
-`stdout`. El resultado es un programa ASP estándar que puede pasarse
-directamente a Clingo:
+If no output file is given, the transformed program is written to `stdout`. The
+result is a standard ASP program that can be passed directly to Clingo:
 
 ```bash
 python dms.py examples/reach.lp reach_dms.lp
 clingo reach_dms.lp
 ```
 
-### Atajo: `dms-solve.sh`
+### Shortcut: `dms-solve.sh`
 
-El script `dms-solve.sh` encadena los dos pasos (transformar + resolver) en un
-solo comando. Cualquier argumento tras el fichero de entrada se pasa tal cual a
-`clingo`:
+The `dms-solve.sh` script chains both steps (transform + solve) into a single
+command. Any argument after the input file is forwarded as-is to `clingo`:
 
 ```bash
-./dms-solve.sh examples/reach.lp              # transforma y resuelve
-./dms-solve.sh examples/reach.lp 0 --stats    # todos los answer sets + estadísticas
-./dms-solve.sh -o reach_dms.lp examples/reach.lp   # conserva el transformado
-./dms-solve.sh -h                             # ayuda
+./dms-solve.sh examples/reach.lp              # transform and solve
+./dms-solve.sh examples/reach.lp 0 --stats    # all answer sets + statistics
+./dms-solve.sh -o reach_dms.lp examples/reach.lp   # keep the transformed program
+./dms-solve.sh -h                             # help
 ```
 
-Opciones: `-o FICHERO` guarda el programa transformado (por defecto usa un
-temporal), `-k` conserva el temporal, `-q` modo silencioso. La variable de
-entorno `PYTHON` permite elegir el intérprete.
+Options: `-o FILE` saves the transformed program (a temporary file by default),
+`-k` keeps the temporary file, `-q` quiet mode. The `PYTHON` environment variable
+selects the interpreter.
 
-## Formato de entrada
+## Input format
 
-Se anota el programa con una o varias directivas `#magic`, que declaran los
-predicados (MDB) a transformar:
+The program is annotated with one or more `#magic` directives, which declare the
+predicates (MDB) to transform:
 
 ```prolog
-#magic reach/2.            % transforma reach/2
+#magic reach/2.            % transform reach/2
 
 reach(X, Y) :- edge(X, Y).
 reach(X, Z) :- reach(X, Y), edge(Y, Z).
@@ -71,53 +68,36 @@ reach(X, Z) :- reach(X, Y), edge(Y, Z).
 query(X) :- source(X), reach(X, Y).
 ```
 
-Solo los predicados declarados con `#magic` se reescriben; el resto del programa
-se copia sin cambios (salvo las semillas que dependen de él).
+Only predicates declared with `#magic` are rewritten; the rest of the program is
+copied unchanged (except for the seeds that depend on it).
 
-## Ejemplos
+## Examples
 
-El directorio [`examples/`](examples/) contiene programas de muestra:
+The [`examples/`](examples/) directory contains sample programs:
 
-| Fichero | Qué ilustra |
+| File | What it illustrates |
 |---|---|
-| `reach.lp` | Alcanzabilidad en grafos (caso conductor, adornado `bf`). |
-| `sameGen.lp` | Misma generación (EDB desconectados, análisis de Sippu). |
-| `factorial.lp`, `fibonacci.lp` | Recursión aritmética sin dominio explícito. |
-| `area.lp` | Aritmética sin dominio (DMS como proveedor de *safety*). |
-| `sat.lp` | Fórmulas como términos compuestos (functores, anónimas). |
-| `member.lp` | Listas con sintaxis Prolog (`cons`). |
+| `reach.lp` | Graph reachability (running example, `bf` adornment). |
+| `sameGen.lp` | Same generation (disconnected EDB, Sippu's analysis). |
+| `factorial.lp`, `fibonacci.lp` | Arithmetic recursion with no explicit domain. |
+| `area.lp` | Arithmetic with no domain (DMS as a *safety* provider). |
+| `sat.lp` | Formulas as compound terms (function symbols, anonymous vars). |
+| `member.lp` | Lists with Prolog syntax (`cons`). |
 
-## Documentación
+## Documentation
 
-[`docs/DMS_ALGORITHM.md`](docs/DMS_ALGORITHM.md) describe la correspondencia
-entre el algoritmo original y la implementación, y las decisiones de diseño
-(SIPS EDB-first, aritmética segura, desanonimización de variables, chequeo de
-estratificación).
+[`docs/DMS_ALGORITHM.md`](docs/DMS_ALGORITHM.md) describes the correspondence
+between the original algorithm and the implementation, and the design decisions
+(EDB-first SIPS, safe arithmetic, anonymous-variable freshening, stratification
+check).
 
-## Cómo citar
-
-Si usas esta herramienta, cita el TFG asociado:
-
-```bibtex
-@mastersthesis{Ferreiro2026dms,
-  author = {Ferreiro Sánchez, Marcelo},
-  title  = {Eliminación de Variables para Predicados Ocultos en Answer Set Programming},
-  school = {Universidade da Coruña},
-  year   = {2026},
-  type   = {Trabajo Fin de Grao},
-  note   = {Implementación: \url{https://github.com/MarceloFerreiro/clingo-magic-sets}}
-}
-```
-
-
-## Referencias
+## References
 
 - M. Alviano, W. Faber, G. Greco, N. Leone. *Magic Sets for Disjunctive Datalog
   Programs*. Artificial Intelligence 187–188 (2012) 156–192.
 - F. Bancilhon, D. Maier, Y. Sagiv, J. D. Ullman. *Magic Sets and Other Strange
   Ways to Implement Logic Programs*. PODS 1986.
 
-## Licencia
+## License
 
-[MIT](LICENSE) © 2026 Marcelo Ferreiro Sánchez. El algoritmo DMS es de Alviano
-et al. (2012); esta implementación es trabajo propio.
+[MIT](LICENSE) © 2026 Marcelo Ferreiro Sánchez.
