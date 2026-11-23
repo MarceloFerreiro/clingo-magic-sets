@@ -5,11 +5,18 @@ Based on: Alviano et al., "Magic Sets for Disjunctive Datalog Programs",
           Artificial Intelligence 187-188 (2012) 156-192.
 
 Usage:
-    python dms.py [--sips {edb,alviano}] input.lp [output.lp]
+    python dms.py [--sips {edb,most-bound-first,hybrid}] [--auto] input.lp [output.lp]
 
 Input format:
     #magic pred/arity.     % declares the MDB predicates to transform
     <ASP rules>
+
+With --auto the MDB is chosen automatically (see auto_select): starting from
+the rules that define the output (#show) and from the constraints, a hidden
+predicate is marked only if some rule body calls it with at least one bound
+argument, and this is propagated through the rules of the marked predicates.
+Explicit #magic directives are kept and added to the selection. Without #show,
+the output is taken to be the predicates that no rule calls (e.g. query/n).
 
 Terminology:
     EDB  - predicates defined by ground facts (empty body)
@@ -20,12 +27,14 @@ Terminology:
 SIPS (--sips):
     edb      EDB-first: non-MDB atoms bind before MDB atoms, and no bindings
              are passed between MDB atoms (default).
-    alviano  scheme of the prototype of Alviano et al. (Sec. 4.1): a chain over
-             all positive body atoms, picking first the one with most bound
-             arguments. Magic rules may contain original (possibly
-             non-deterministic) IDB atoms, which makes the magic sets dynamic.
-    hybrid   most bound first as 'alviano', but ties are broken in favour of
-             non-MDB atoms instead of by textual body order.
+    most-bound-first
+             the SIPS of the prototype of Alviano et al. (Sec. 4.1): a chain
+             over all positive body atoms, picking first the one with most
+             bound arguments, ties broken by textual order. Magic rules may
+             contain original (possibly non-deterministic) IDB atoms, which
+             makes the magic sets dynamic.
+    hybrid   most bound first, but ties are broken in favour of non-MDB atoms
+             instead of by textual body order.
 """
 from __future__ import annotations
 import re
@@ -563,12 +572,12 @@ def sips_edb(
     return steps + _tail_steps(rule, head_idx, mdb, bound, before)
 
 
-def sips_alviano(
+def sips_most_bound_first(
     rule: A.AST, head_idx: int, head_args: list, head_adorn: str, mdb: set,
     prefer_non_mdb: bool = False,
 ) -> list[SipsStep]:
     """
-    SIPS of the prototype of Alviano et al. (Sec. 4.1):
+    Most bound first, the SIPS of the prototype of Alviano et al. (Sec. 4.1):
       - The positive body atoms (MDB or not) form a chain. At each step the
         atom with most bound arguments is picked; ties are broken by the
         original body order.
@@ -613,19 +622,151 @@ def sips_hybrid(
     rule: A.AST, head_idx: int, head_args: list, head_adorn: str, mdb: set,
 ) -> list[SipsStep]:
     """
-    Most bound first, as sips_alviano, but ties are broken in favour of
-    non-MDB atoms (EDB and non-MDB IDB) instead of by textual body order, so
-    the rewriting does not depend on how the body happens to be written.
+    Most bound first, but ties are broken in favour of non-MDB atoms (EDB and
+    non-MDB IDB) instead of by textual body order, so the rewriting does not
+    depend on how the body happens to be written.
     """
-    return sips_alviano(rule, head_idx, head_args, head_adorn, mdb,
-                        prefer_non_mdb=True)
+    return sips_most_bound_first(rule, head_idx, head_args, head_adorn, mdb,
+                                 prefer_non_mdb=True)
 
 
 SIPS: dict[str, Callable[..., list[SipsStep]]] = {
     "edb": sips_edb,
-    "alviano": sips_alviano,
+    "most-bound-first": sips_most_bound_first,
     "hybrid": sips_hybrid,
 }
+
+
+# Automatic choice of the MDB (--auto)
+
+
+def _call_lits(rule: A.AST) -> list[A.AST]:
+    """Plain body literals that call a predicate (positive or negated)."""
+    return [l for l in rule.body if _is_pos_sym(l) or _is_neg_sym(l)]
+
+
+def _auto_candidates(rules: list, others: list) -> set[tuple[str, int]]:
+    """
+    Hidden IDB predicates that the transformation can rewrite: defined by some
+    rule with a body, with a plain or disjunctive head, not shown, and never
+    used where an MDB predicate is not supported (aggregates, conditions,
+    choice heads, non-rule statements).
+    """
+    idb: set[tuple[str, int]] = set()
+    excluded: set[tuple[str, int]] = set()
+    for rule in rules:
+        heads = _head_sigs(rule)
+        plain_head = (_is_pos_sym(rule.head)
+                      or rule.head.ast_type == A.ASTType.Disjunction)
+        if list(rule.body):
+            idb |= heads
+        if heads and not plain_head:
+            excluded |= heads                  # choice or aggregate head
+        excluded |= _condition_sigs(rule.head)
+        for lit in rule.body:
+            plain = (lit.ast_type == A.ASTType.Literal
+                     and lit.atom.ast_type in (A.ASTType.SymbolicAtom,
+                                               A.ASTType.Comparison,
+                                               A.ASTType.BooleanConstant))
+            if not plain:
+                excluded |= _sym_sigs(lit)
+    shows = False
+    for stm in others:
+        if stm.ast_type == A.ASTType.ShowSignature:
+            excluded.add((stm.name, stm.arity))
+            shows = True
+        else:
+            shows |= stm.ast_type == A.ASTType.ShowTerm
+            excluded |= _sym_sigs(stm)
+    if not shows:
+        excluded |= _sinks(rules)
+    return idb - excluded
+
+
+def _sinks(rules: list) -> set[tuple[str, int]]:
+    """Predicates defined by some rule but called by none (e.g. query/n)."""
+    called: set[tuple[str, int]] = set()
+    defined: set[tuple[str, int]] = set()
+    for rule in rules:
+        called |= _body_sigs(rule)
+        defined |= _head_sigs(rule)
+    return defined - called
+
+
+def _bound_closure(rules: list, cand: set, sips: Callable) -> set:
+    """
+    Candidates reached with at least one bound argument, starting from the
+    rules whose head is not a candidate (output rules and constraints) and
+    following the body calls of the rules of the marked predicates under the
+    given SIPS (other atoms of a disjunctive head are not followed).
+    """
+    marked: set[tuple[str, int]] = set()
+    todo: deque = deque()
+
+    def mark(sig, adorn):
+        if "b" in adorn:
+            marked.add(sig)
+            todo.append((sig, adorn))
+
+    for rule in rules:
+        if _head_sigs(rule) & cand:
+            continue
+        bound: set[str] = set()
+        for lit in rule.body:
+            if _is_pos_sym(lit) and _sig(lit.atom) not in cand:
+                bound |= _vars(lit)
+        for lit in _call_lits(rule):
+            if _sig(lit.atom) in cand:
+                mark(_sig(lit.atom), _adorn(_args(lit.atom), bound))
+    seen: set = set()
+    while todo:
+        sig, adorn = todo.popleft()
+        if (sig, adorn) in seen:
+            continue
+        seen.add((sig, adorn))
+        for rule in rules:
+            for idx, name, args in _mdb_heads(rule, cand):
+                if (name, len(args)) != sig:
+                    continue
+                for st in sips(rule, idx, args, adorn, cand):
+                    if st.kind != "head":
+                        mark(_sig(st.lit.atom), st.adorn)
+    return marked
+
+
+def auto_select(rules: list, others: list, sips: Callable,
+                fixed: set = frozenset()) -> set[tuple[str, int]]:
+    """
+    Choose the MDB automatically. A hidden predicate is worth marking only if
+    the query passes it some binding: it is marked when some rule body calls it
+    with at least one bound argument, starting from the rules that define the
+    output and from the constraints, and following the rules of the marked
+    predicates. A marked predicate that is still called with all arguments
+    free from a rule that reaches the output needs all its instances, so it is
+    unmarked and the selection is recomputed.
+    """
+    cand = _auto_candidates(rules, others) - set(fixed)
+    while True:
+        mdb = _bound_closure(rules, cand | set(fixed), sips) | set(fixed)
+        mdb &= cand | set(fixed)
+        region = _output_region(rules, others, mdb)
+        drop: set[tuple[str, int]] = set()
+        for rule in rules:
+            heads = _head_sigs(rule)
+            if heads & mdb or (heads and not heads & region):
+                continue
+            bound: set[str] = set()
+            for lit in rule.body:
+                if _is_pos_sym(lit) and _sig(lit.atom) not in mdb:
+                    bound |= _vars(lit)
+            for lit in _call_lits(rule):
+                s = _sig(lit.atom)
+                if s in mdb and s not in fixed \
+                        and "b" not in _adorn(_args(lit.atom), bound):
+                    drop.add(s)
+        if not drop:
+            return mdb
+        cand -= drop
 
 
 # Generate magic rules (Fig. 4)
@@ -717,8 +858,9 @@ class DMSTransformer:
     affect f/2.
     """
 
-    def __init__(self, sips: str = "edb"):
+    def __init__(self, sips: str = "edb", auto: bool = False):
         self.sips = SIPS[sips]
+        self.auto = auto
         self.mdb: set[tuple[str, int]] = set()   # MDB predicates (via #magic)
         self.mdb_rules: list[A.AST] = []          # IDB rules with an MDB head
         self._all_rules: list[A.AST] = []         # all rules (for stratification)
@@ -763,6 +905,16 @@ class DMSTransformer:
         A.parse_string(clean, collect)
 
         self._all_rules = all_rules
+        if self.auto:
+            if not any(s.ast_type in (A.ASTType.ShowSignature,
+                                      A.ASTType.ShowTerm) for s in passthrough):
+                outs = ", ".join(f"{n}/{a}" for n, a in sorted(_sinks(all_rules)))
+                print(f"warning: no #show; --auto takes as output the predicates "
+                      f"not called by any rule ({outs}). Add #show to choose "
+                      f"them explicitly.", file=sys.stderr)
+            self.mdb = auto_select(all_rules, passthrough, self.sips, self.mdb)
+            names = ", ".join(f"{n}/{a}" for n, a in sorted(self.mdb)) or "none"
+            print(f"auto: MDB = {names}", file=sys.stderr)
         _check_unsupported(all_rules, passthrough, self.mdb)
         _check_free_calls(all_rules, passthrough, self.mdb)
 
@@ -910,13 +1062,15 @@ def main():
     ap = argparse.ArgumentParser(description="Dynamic Magic Sets transformation")
     ap.add_argument("input")
     ap.add_argument("output", nargs="?")
-    ap.add_argument("--sips", choices=sorted(SIPS), default="edb")
+    ap.add_argument("--sips", choices=list(SIPS), default="edb")
+    ap.add_argument("--auto", action="store_true",
+                    help="choose the MDB predicates automatically from #show")
     args = ap.parse_args()
 
     with open(args.input, encoding="utf-8") as f:
         text = f.read()
     try:
-        result = DMSTransformer(args.sips).transform(text)
+        result = DMSTransformer(args.sips, args.auto).transform(text)
     except UnsupportedMDBUse as e:
         print(f"error: {e}", file=sys.stderr)
         sys.exit(1)

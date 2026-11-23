@@ -27,7 +27,7 @@ pip install -r requirements.txt
 ## Usage
 
 ```bash
-python dms.py [--sips {edb,alviano,hybrid}] input.lp [output.lp]
+python dms.py [--sips {edb,most-bound-first,hybrid}] [--auto] input.lp [output.lp]
 ```
 
 If no output file is given, the transformed program is written to `stdout`. The
@@ -40,9 +40,16 @@ clingo reach_dms.lp
 
 The `--sips` option selects the sideways information passing strategy: `edb`
 (default) binds non-MDB atoms before MDB atoms and passes no bindings between
-MDB atoms; `alviano` is the *most bound first* strategy of Alviano et al.
-(ties broken by textual order), whose magic rules may contain MDB atoms;
-`hybrid` is like `alviano` but breaks ties in favour of non-MDB atoms.
+MDB atoms; `most-bound-first` is the strategy of the prototype of Alviano et
+al. (ties broken by textual order), whose magic rules may contain MDB atoms;
+`hybrid` is like `most-bound-first` but breaks ties in favour of non-MDB atoms.
+
+With `--auto` the `#magic` predicates are chosen automatically: a hidden
+predicate is marked only if the query passes it some binding, i.e. if some
+rule body calls it with at least one bound argument, starting from the rules
+of the `#show`n predicates and the constraints and following the rules of the
+marked predicates. Explicit `#magic` directives are kept. Without `#show`, the
+output is taken to be the predicates that no rule calls (e.g. `query/n`).
 
 Programs that the rewriting cannot handle correctly (an MDB atom inside an
 aggregate, a conditional literal or `#minimize`, or an all-free call to an MDB

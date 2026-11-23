@@ -27,7 +27,7 @@ pip install -r requirements.txt
 ## Uso
 
 ```bash
-python dms.py [--sips {edb,alviano,hybrid}] entrada.lp [salida.lp]
+python dms.py [--sips {edb,most-bound-first,hybrid}] [--auto] entrada.lp [salida.lp]
 ```
 
 Si no se indica fichero de salida, el programa transformado se escribe por
@@ -41,10 +41,18 @@ clingo reach_dms.lp
 
 La opción `--sips` elige la estrategia de paso de información lateral:
 `edb` (por defecto) liga los átomos no-MDB antes que los MDB y no pasa
-ligaduras entre átomos MDB; `alviano` es la estrategia *most bound first* de
-Alviano et al. (empates por orden textual), cuyas reglas mágicas pueden
-contener átomos MDB; `hybrid` es como `alviano`, pero desempata a favor de los
-átomos no-MDB.
+ligaduras entre átomos MDB; `most-bound-first` es la estrategia del prototipo
+de Alviano et al. (empates por orden textual), cuyas reglas mágicas pueden
+contener átomos MDB; `hybrid` es como `most-bound-first`, pero desempata a
+favor de los átomos no-MDB.
+
+Con `--auto` los predicados `#magic` se eligen automáticamente: un predicado
+oculto solo se marca si la consulta le pasa alguna ligadura, es decir, si algún
+cuerpo lo llama con al menos un argumento ligado, partiendo de las reglas de
+los predicados en `#show` y de las restricciones y siguiendo las reglas de los
+predicados marcados. Las directivas `#magic` explícitas se respetan. Sin
+`#show`, se toma como salida los predicados que ninguna regla llama (p. ej.
+`query/n`).
 
 Los programas que la reescritura no puede tratar correctamente (un átomo MDB
 dentro de un agregado, de un literal condicional o de `#minimize`, o una
