@@ -27,7 +27,7 @@ pip install -r requirements.txt
 ## Uso
 
 ```bash
-python dms.py entrada.lp [salida.lp]
+python dms.py [--sips {edb,alviano,hybrid}] entrada.lp [salida.lp]
 ```
 
 Si no se indica fichero de salida, el programa transformado se escribe por
@@ -38,6 +38,19 @@ directamente a Clingo:
 python dms.py examples/reach.lp reach_dms.lp
 clingo reach_dms.lp
 ```
+
+La opción `--sips` elige la estrategia de paso de información lateral:
+`edb` (por defecto) liga los átomos no-MDB antes que los MDB y no pasa
+ligaduras entre átomos MDB; `alviano` es la estrategia *most bound first* de
+Alviano et al. (empates por orden textual), cuyas reglas mágicas pueden
+contener átomos MDB; `hybrid` es como `alviano`, pero desempata a favor de los
+átomos no-MDB.
+
+Los programas que la reescritura no puede tratar correctamente (un átomo MDB
+dentro de un agregado, de un literal condicional o de `#minimize`, o una
+llamada con todos los argumentos libres a un predicado MDB desde una regla que
+define la salida) se rechazan con un error en lugar de reescribirse en
+silencio.
 
 ### Atajo: `dms-solve.sh`
 

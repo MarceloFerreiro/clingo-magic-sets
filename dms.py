@@ -1,42 +1,51 @@
 """
-Transformación Magic Sets para programas ASP en clingo
+Dynamic Magic Sets transformation for ASP programs in clingo.
 
-Basado en: Alviano et al., "Magic Sets for Disjunctive Datalog Programs",
-           AI 187-188 (2012) 156-192.
+Based on: Alviano et al., "Magic Sets for Disjunctive Datalog Programs",
+          Artificial Intelligence 187-188 (2012) 156-192.
 
-Uso:
-    python dms.py input.lp [output.lp]
+Usage:
+    python dms.py [--sips {edb,alviano}] input.lp [output.lp]
 
-Formato de input:
-    #magic pred/aridad.    % declara los predicados MDB a transformar
+Input format:
+    #magic pred/arity.     % declares the MDB predicates to transform
     <ASP rules>
 
-Terminología:
-    EDB  — hechos ground (cuerpo vacío)
-    IDB  — reglas derivadas (cuerpo no vacío)
-    MDB  — subconjunto del IDB declarado via #magic, son los predicados
-           que se transforman con magic sets
+Terminology:
+    EDB  - predicates defined by ground facts (empty body)
+    IDB  - predicates defined by derivation rules (non-empty body)
+    MDB  - subset of the IDB declared via #magic: the predicates that are
+           rewritten with magic sets
 
-SIPS: prioridad EDB (todos los átomos EDB/IDB-no-MDB antes que los MDB).
+SIPS (--sips):
+    edb      EDB-first: non-MDB atoms bind before MDB atoms, and no bindings
+             are passed between MDB atoms (default).
+    alviano  scheme of the prototype of Alviano et al. (Sec. 4.1): a chain over
+             all positive body atoms, picking first the one with most bound
+             arguments. Magic rules may contain original (possibly
+             non-deterministic) IDB atoms, which makes the magic sets dynamic.
+    hybrid   most bound first as 'alviano', but ties are broken in favour of
+             non-MDB atoms instead of by textual body order.
 """
 from __future__ import annotations
 import re
 import sys
 from collections import deque
+from typing import Callable, NamedTuple
 from clingo import ast as A
 
-# ── Localización sintética para nodos AST generados ─────────────────────────
+# ── Synthetic location for generated AST nodes ─────────────────────────────
 
 _P = A.Position("<dms>", 1, 1)
 LOC = A.Location(_P, _P)
 
-# Directiva #magic
+# The #magic directive
 
 _MAGIC_RE = re.compile(r"#magic\s+(\w+)/(\d+)\s*\.", re.IGNORECASE)
 
 
 def parse_magic(text: str) -> set[tuple[str, int]]:
-    """Devuelve {(name, arity), ...} para todas las directivas #magic pred/n."""
+    """Return {(name, arity), ...} for every #magic pred/n directive."""
     return {(m.group(1), int(m.group(2))) for m in _MAGIC_RE.finditer(text)}
 
 
@@ -44,11 +53,11 @@ def strip_magic(text: str) -> str:
     return _MAGIC_RE.sub("", text)
 
 
-# Recolección de variables
+# Variable collection
 
 
 def _vars(node: A.AST) -> set[str]:
-    """Recopila de forma recursiva todos los nombres de Variables en el AST."""
+    """Recursively collect the names of all Variables in the AST."""
     if node.ast_type == A.ASTType.Variable:
         return {node.name}
     result: set[str] = set()
@@ -66,11 +75,11 @@ def _vars(node: A.AST) -> set[str]:
     return result
 
 
-# Literales
+# Literals
 
 
 def _is_pos_sym(lit: A.AST) -> bool:
-    """Literal simbólico positivo: p(args)."""
+    """Positive symbolic literal: p(args)."""
     return (
         lit.ast_type == A.ASTType.Literal
         and lit.sign == A.Sign.NoSign
@@ -80,7 +89,7 @@ def _is_pos_sym(lit: A.AST) -> bool:
 
 
 def _is_neg_sym(lit: A.AST) -> bool:
-    """Literal simbólico negado: not p(args)."""
+    """Negated symbolic literal: not p(args)."""
     return (
         lit.ast_type == A.ASTType.Literal
         and lit.sign == A.Sign.Negation
@@ -90,7 +99,7 @@ def _is_neg_sym(lit: A.AST) -> bool:
 
 
 def _is_cmp(lit: A.AST) -> bool:
-    """Literal de comparación o aritmética: X = ..., N > 0, etc."""
+    """Comparison or arithmetic literal: X = ..., N > 0, etc."""
     return (
         lit.ast_type == A.ASTType.Literal
         and lit.atom.ast_type == A.ASTType.Comparison
@@ -98,7 +107,7 @@ def _is_cmp(lit: A.AST) -> bool:
 
 
 def _sig(atom: A.AST) -> tuple[str, int]:
-    """(name, arity) de un nodo SymbolicAtom."""
+    """(name, arity) of a SymbolicAtom node."""
     s = atom.symbol
     return s.name, len(s.arguments)
 
@@ -107,24 +116,196 @@ def _args(atom: A.AST) -> list:
     return list(atom.symbol.arguments)
 
 
-# Adornado
+# Unsupported uses of MDB predicates
+
+
+class UnsupportedMDBUse(Exception):
+    """An MDB atom occurs in a context the transformation does not handle."""
+
+
+def _children(node: A.AST):
+    for key in node.child_keys:
+        child = getattr(node, key)
+        if isinstance(child, A.AST):
+            yield child
+        else:
+            try:
+                for c in child:
+                    if isinstance(c, A.AST):
+                        yield c
+            except TypeError:
+                pass
+
+
+def _sym_sigs(node: A.AST) -> set[tuple[str, int]]:
+    """All (name, arity) of symbolic atoms anywhere below node."""
+    if node.ast_type == A.ASTType.SymbolicAtom:
+        s = node.symbol
+        if s.ast_type == A.ASTType.Function:
+            return {(s.name, len(s.arguments))}
+        return set()
+    out: set[tuple[str, int]] = set()
+    for c in _children(node):
+        out |= _sym_sigs(c)
+    return out
+
+
+def _condition_sigs(node: A.AST) -> set[tuple[str, int]]:
+    """Signatures of the atoms in the conditions (':' parts) below node."""
+    out: set[tuple[str, int]] = set()
+    if node.ast_type == A.ASTType.ConditionalLiteral:
+        for cond in node.condition:
+            out |= _sym_sigs(cond)
+    for c in _children(node):
+        out |= _condition_sigs(c)
+    return out
+
+
+def _head_sigs(rule: A.AST) -> set[tuple[str, int]]:
+    """Predicates defined by the rule head (conditions excluded)."""
+    return _sym_sigs(rule.head) - _condition_sigs(rule.head)
+
+
+def _body_sigs(rule: A.AST) -> set[tuple[str, int]]:
+    """Predicates the rule depends on: body (aggregates included) and the
+    conditions of its head elements."""
+    out = _condition_sigs(rule.head)
+    for lit in rule.body:
+        out |= _sym_sigs(lit)
+    return out
+
+
+def _output_region(rules: list, others: list, mdb: set) -> set[tuple[str, int]]:
+    """
+    Predicates whose extension reaches the output without passing through an
+    MDB predicate (the non-MDB call graph seen from the output).
+
+    Roots: the #show'n predicates (every non-MDB predicate if there is no
+    #show), the bodies of #show terms and the bodies of constraints. From a
+    root we follow the rules defining it, but never expand an MDB predicate:
+    the instances of an MDB predicate that matter are the ones its magic
+    predicate selects, so what it depends on is handled by the rewriting.
+    """
+    shows = [s for s in others
+             if s.ast_type in (A.ASTType.ShowSignature, A.ASTType.ShowTerm)]
+    roots: set[tuple[str, int]] = set()
+    if shows:
+        for s in shows:
+            if s.ast_type == A.ASTType.ShowSignature:
+                roots.add((s.name, s.arity))
+            else:
+                for lit in s.body:
+                    roots |= _sym_sigs(lit)
+    else:
+        for r in rules:
+            roots |= (_head_sigs(r) | _body_sigs(r)) - mdb
+    defs: dict[tuple[str, int], list] = {}
+    for r in rules:
+        heads = _head_sigs(r)
+        if not heads:                      # constraint: always of interest
+            roots |= _body_sigs(r)
+        for h in heads:
+            defs.setdefault(h, []).append(r)
+    region, todo = set(), list(roots)
+    while todo:
+        p = todo.pop()
+        if p in region:
+            continue
+        region.add(p)
+        if p in mdb:
+            continue
+        for r in defs.get(p, []):
+            # head-to-head: the other head atoms of a disjunction decide
+            # whether the rule supports p
+            todo.extend((_head_sigs(r) | _body_sigs(r)) - region)
+    return region
+
+
+def _check_free_calls(rules: list, others: list, mdb: set) -> None:
+    """
+    Reject an MDB call with all arguments free in a rule whose result reaches
+    the output (see _output_region). Such a call produces no seed, so the rule
+    would only see the instances needed by other calls and answers could be
+    lost (e.g. b(X) :- p(X) with #show b/1). Calls outside that region, such
+    as path(X,Y) :- sp(X,Y) in sp.lp, are allowed.
+    """
+    region = _output_region(rules, others, mdb)
+    for rule in rules:
+        heads = _head_sigs(rule)
+        if heads & mdb:
+            continue                       # rewritten by DMS itself
+        if heads and not heads & region:
+            continue                       # result does not reach the output
+        bound: set[str] = set()
+        for lit in rule.body:
+            if _is_pos_sym(lit) and _sig(lit.atom) not in mdb:
+                bound |= _vars(lit)
+        for lit in rule.body:
+            if not (_is_pos_sym(lit) or _is_neg_sym(lit)):
+                continue
+            if _sig(lit.atom) not in mdb:
+                continue
+            if "b" not in _adorn(_args(lit.atom), bound):
+                n, a = _sig(lit.atom)
+                raise UnsupportedMDBUse(
+                    f"line {rule.location.begin.line}: MDB predicate {n}/{a} is "
+                    f"called with all arguments free in a rule whose result "
+                    f"reaches the output; no seed can be generated for this "
+                    f"call and answers would be lost. Bind an argument or "
+                    f"remove the #magic directive for {n}/{a}.")
+
+
+def _check_unsupported(rules: list, others: list, mdb: set) -> None:
+    """
+    Reject MDB atoms inside aggregates, conditional literals or non-rule
+    statements. The transformation only looks at plain body literals, so such
+    occurrences would get no magic rules and the program would silently lose
+    answers (e.g. #count{X : p(X)} evaluating to 0).
+    """
+    def fail(stm, sigs, where):
+        names = ", ".join(f"{n}/{a}" for n, a in sorted(sigs))
+        line = stm.location.begin.line
+        raise UnsupportedMDBUse(
+            f"line {line}: MDB predicate {names} used {where}; this is not "
+            f"supported by the transformation. Remove the #magic directive "
+            f"for {names}.")
+
+    for rule in rules:
+        for lit in rule.body:
+            plain = (lit.ast_type == A.ASTType.Literal
+                     and lit.atom.ast_type in (A.ASTType.SymbolicAtom,
+                                               A.ASTType.Comparison,
+                                               A.ASTType.BooleanConstant))
+            if not plain:
+                bad = _sym_sigs(lit) & mdb
+                if bad:
+                    fail(rule, bad, "inside an aggregate or conditional literal")
+        bad = _condition_sigs(rule.head) & mdb
+        if bad:
+            fail(rule, bad, "in the condition of a head element")
+    for stm in others:
+        bad = _sym_sigs(stm) & mdb
+        if bad:
+            fail(stm, bad, f"in a {str(stm.ast_type).split('.')[-1]} statement")
+
+
+# Adornment
 
 
 def _adorn(args: list, bound: set) -> str:
-    """'b' si es constante o variable en bound, 'f' en cualquier otro caso."""
-    return "".join(
-        "b" if (a.ast_type != A.ASTType.Variable or a.name in bound) else "f"
-        for a in args
-    )
+    """'b' if all variables of the argument are in bound (always for ground
+    terms), 'f' otherwise. So X+1 or f(X) with X free are not marked as
+    bound."""
+    return "".join("b" if _vars(a) <= bound else "f" for a in args)
 
 
 def _bound_from(args: list, adorn: str) -> set:
-    """Nombres de variables en posiciones 'b' del adornado."""
+    """Names of the variables in the 'b' positions of the adornment."""
     return {v for a, b in zip(args, adorn) if b == "b" for v in _vars(a)}
 
 
 def _freshen_anon(node: A.AST, counter: list) -> A.AST:
-    """Reemplaza variables anónimas '_' con AnonVarN para evitar unsafe heads."""
+    """Replace anonymous variables '_' with AnonVarN to avoid unsafe heads."""
     if node.ast_type == A.ASTType.Variable and node.name == "_":
         fresh = A.Variable(LOC, f"AnonVar{counter[0]}")
         counter[0] += 1
@@ -135,11 +316,11 @@ def _freshen_anon(node: A.AST, counter: list) -> A.AST:
     return node
 
 
-# Constructores de AST
+# AST constructors
 
 
 def _pos_lit(name: str, args: list) -> A.AST:
-    """Literal positivo: name(args)."""
+    """Positive literal: name(args)."""
     return A.Literal(
         LOC,
         A.Sign.NoSign,
@@ -148,33 +329,26 @@ def _pos_lit(name: str, args: list) -> A.AST:
 
 
 def _magic_lit(pred: str, adorn: str, args: list) -> A.AST:
-    """magic_pred_adorn(bound_args) como literal positivo."""
+    """magic_pred_adorn(bound_args) as a positive literal."""
     bound = [a for a, b in zip(args, adorn) if b == "b"]
     return _pos_lit(f"magic_{pred}_{adorn}", bound)
-
-
-def _adorned_lit(orig: A.AST, adorn: str) -> A.AST:
-    """Renombra pred(args) pred_adorn(args) preservando el signo del literal."""
-    sym = orig.atom.symbol
-    new_sym = A.Function(LOC, f"{sym.name}_{adorn}", list(sym.arguments), False)
-    return A.Literal(LOC, orig.sign, A.SymbolicAtom(new_sym))
 
 
 def _rule(head: A.AST, body: list) -> A.AST:
     return A.Rule(LOC, head, body)
 
 
-# Aritmética (safety)
+# Arithmetic (safety)
 
 
 def _arith_binds(lit: A.AST, bound: set) -> set | None:
     """
-    Decide si una comparación es safe para inclir en el cuerpo de una magic rule.
+    Decide whether a comparison can safely be included in a magic rule body.
 
-    Devuelve el conjunto de nuevas variables bound:
-      - Restricción pura (todas las variables ya bound, e.g. N > 0): return {}
-      - Igualdad simple X = expr(bound_vars): bindea X, return {X}
-      - Cualquier otro caso: return None (no se puede incluir de forma safe)
+    Returns the set of newly bound variables:
+      - Pure restriction (all variables already bound, e.g. N > 0): {}
+      - Simple equality X = expr(bound_vars): binds X, returns {X}
+      - Any other case: None (it cannot be included safely)
     """
     if not _is_cmp(lit):
         return None
@@ -198,8 +372,8 @@ def _arith_binds(lit: A.AST, bound: set) -> set | None:
 
 def _safe_arith(arith: list, initial_bound: set) -> tuple[list, set]:
     """
-    Procesa literales aritméticos en orden y devuelve (safe_lits, final_bound).
-    Solo incluye literales cuyas variables RHS (lado derecho) ya están bound.
+    Process arithmetic literals in order and return (safe_lits, final_bound).
+    Only literals whose right-hand-side variables are already bound are kept.
     """
     safe: list[A.AST] = []
     bound = set(initial_bound)
@@ -211,14 +385,14 @@ def _safe_arith(arith: list, initial_bound: set) -> tuple[list, set]:
     return safe, bound
 
 
-# Estratificación
+# Stratification
 
 
 def _neg_cycle_exists(start: tuple, edges: dict) -> bool:
-    """Devuelve True si 'start' participa en un ciclo con al menos una arista negativa.
+    """Return True if 'start' lies on a cycle with at least one negative edge.
 
-    El estado (nodo, tiene_neg) registra si se ha atravesado alguna arista negativa
-    en el camino actual desde 'start'.
+    The state (node, has_neg) records whether a negative edge has been
+    traversed on the current path from 'start'.
     """
     visited: set = set()
     stack = [(start, False)]
@@ -237,7 +411,7 @@ def _neg_cycle_exists(start: tuple, edges: dict) -> bool:
 
 
 def _check_stratification(all_rules: list, mdb: set) -> list[str]:
-    """Devuelve avisos para predicados MDB implicados en un ciclo no estratificado."""
+    """Return warnings for MDB predicates involved in a non-stratified cycle."""
     edges: dict[tuple, set] = {}
     for rule in all_rules:
         head = rule.head
@@ -264,23 +438,23 @@ def _check_stratification(all_rules: list, mdb: set) -> list[str]:
         if _neg_cycle_exists(pred, edges):
             name, arity = pred
             warnings.append(
-                f"AVISO: #magic {name}/{arity} no está estratificado "
-                f"(se detectó un ciclo a través de negación). "
-                f"La transformación magic sets puede no preservar la semántica."
+                f"warning: #magic {name}/{arity} is not stratified "
+                f"(a cycle through negation was found). "
+                f"The magic sets transformation may not preserve the semantics."
             )
     return warnings
 
 
-# Clasificación de literales del cuerpo
+# Classification of body literals
 
 
 def _classify(body: list, mdb: set) -> tuple[list, list, list, list]:
     """
-    Clasifica los literales del cuerpo en 4 grupos (cada elemento es (body_index, lit)):
-      non_mdb_pos: átomos simbólicos positivos que NO son MDB (EDB + IDB no magic)
-      arith:       comparaciones y aritmética
-      mdb_pos:     átomos simbólicos positivos que son MDB
-      neg:         literales negados (MDB o no)
+    Split the body literals into 4 groups (each element is (body_index, lit)):
+      non_mdb_pos: positive symbolic atoms that are NOT MDB (EDB + non-MDB IDB)
+      arith:       comparisons and arithmetic
+      mdb_pos:     positive symbolic atoms that are MDB
+      neg:         negated literals (MDB or not)
     """
     non_mdb_pos, arith, mdb_pos, neg = [], [], [], []
     for i, lit in enumerate(body):
@@ -293,13 +467,13 @@ def _classify(body: list, mdb: set) -> tuple[list, list, list, list]:
     return non_mdb_pos, arith, mdb_pos, neg
 
 
-# Extracción de cabezas MDB
+# Extraction of MDB head atoms
 
 
 def _mdb_heads(rule: A.AST, mdb: set) -> list[tuple[int, str, list]]:
     """
-    Devuelve [(elem_index, pred_name, args)] para cada átomo MDB en la cabeza.
-    Maneja tanto cabezas simples como disjuntivas.
+    Return [(elem_index, pred_name, args)] for every MDB atom in the head.
+    Handles both simple and disjunctive heads.
     """
     head = rule.head
     res = []
@@ -317,186 +491,165 @@ def _mdb_heads(rule: A.AST, mdb: set) -> list[tuple[int, str, list]]:
     return res
 
 
-# Adornado (Fig. 3)
+# SIPS
 
 
-def adorn_rule(
-    rule: A.AST,
-    head_name: str,
-    head_args: list,
-    head_adorn: str,
-    head_idx: int,
-    mdb: set,
-    S: deque,
-    D: set,
-) -> tuple[dict, dict, dict]:
+class SipsStep(NamedTuple):
     """
-    Computa los adornados para los átomos del cuerpo usando SIPS con prioridad EDB.
+    An MDB atom of the rule, adorned according to the SIPS.
 
-    Orden del SIPS:
-      1. Bindings del adornado de la cabeza
-      2. Átomos no-MDB positivos (EDB y IDB no magic): ligan todas sus variables
-      3. Aritmética safe: X = expr(bound) bindea X
-      4. Átomos MDB positivos: adornados con el conjunto bound acumulado (fijo)
-      5. Átomos MDB negados: consumen bindings, no producen
-
-    Devuelve:
-      body_adorns:       {body_index: adorn_str}  para átomos MDB positivos del cuerpo
-      neg_adorns:        {body_index: adorn_str}  para átomos MDB negados del cuerpo
-      other_head_adorns: {head_elem_idx: adorn_str} para otros átomos MDB de la cabeza
-                         (solo se usa en reglas disjuntivas)
+      kind:   "pos" (positive body), "neg" (negated body) or "head" (another
+              atom of a disjunctive head)
+      idx:    index of the literal in the body or in the head
+      lit:    the original literal
+      adorn:  adornment of the atom
+      before: literals that precede it in the SIPS (original positive atoms and
+              safe arithmetic); they form the body of its magic rule (Fig. 4)
     """
-    body = list(rule.body)
-    non_mdb_pos, arith_raw, mdb_pos, neg = _classify(body, mdb)
+    kind: str
+    idx: int
+    lit: A.AST
+    adorn: str
+    before: list
 
-    bound = _bound_from(head_args, head_adorn)
 
-    # Paso 1: átomos no-MDB ligan todas sus variables
-    for _, lit in non_mdb_pos:
-        bound |= _vars(lit)
-
-    # Paso 2: aritmética safe extiende bound antes de adornar los MDB
-    arith_lits = [lit for _, lit in arith_raw]
-    _, bound = _safe_arith(arith_lits, bound)
-
-    # Paso 3: átomos MDB positivos, adornados con el conjunto bound fijo.
-    # bound NO se actualiza entre llamadas MDB (sin propagación MDB-a-MDB).
-    body_adorns: dict[int, str] = {}
-    for i, lit in mdb_pos:
-        args = _args(lit.atom)
-        adorn = _adorn(args, bound)
-        body_adorns[i] = adorn
-        name, _ = _sig(lit.atom)
-        if "b" in adorn:
-            ap = (name, adorn)
-            if ap not in D and ap not in list(S):
-                S.append(ap)
-        bound |= _vars(lit)
-
-    # Paso 4: átomos MDB negados (procesados al final, no producen bindings)
-    neg_adorns: dict[int, str] = {}
-    for i, lit in neg:
-        if not _is_neg_sym(lit):
-            continue
-        name, arity = _sig(lit.atom)
-        if (name, arity) not in mdb:
-            continue
-        args = _args(lit.atom)
-        adorn = _adorn(args, bound)
-        neg_adorns[i] = adorn
-        if "b" in adorn:
-            ap = (name, adorn)
-            if ap not in D and ap not in list(S):
-                S.append(ap)
-
-    # Paso 5: otros átomos MDB en cabezas disjuntivas
-    other_head_adorns: dict[int, str] = {}
+def _tail_steps(
+    rule: A.AST, head_idx: int, mdb: set, bound: set, before: list,
+) -> list[SipsStep]:
+    """
+    Negated MDB atoms and the other MDB atoms of the head. They provide no
+    bindings (Def. 3.3, condition 1.b), so they go last, preceded by the whole
+    positive body.
+    """
+    steps = []
+    for i, lit in enumerate(rule.body):
+        if _is_neg_sym(lit) and _sig(lit.atom) in mdb:
+            steps.append(SipsStep(
+                "neg", i, lit, _adorn(_args(lit.atom), bound), before))
     if rule.head.ast_type == A.ASTType.Disjunction:
         for j, elem in enumerate(rule.head.elements):
             lit = elem.literal
-            if j == head_idx or not _is_pos_sym(lit):
+            if j == head_idx or not _is_pos_sym(lit) or _sig(lit.atom) not in mdb:
                 continue
-            name, arity = _sig(lit.atom)
-            if (name, arity) not in mdb:
-                continue
-            args = _args(lit.atom)
-            adorn = _adorn(args, bound)
-            other_head_adorns[j] = adorn
-            ap = (name, adorn)
-            if ap not in D and ap not in list(S):
-                S.append(ap)
-
-    return body_adorns, neg_adorns, other_head_adorns
+            steps.append(SipsStep(
+                "head", j, lit, _adorn(_args(lit.atom), bound), before))
+    return steps
 
 
-# Generar magic rules (Fig. 4)
+def sips_edb(
+    rule: A.AST, head_idx: int, head_args: list, head_adorn: str, mdb: set,
+) -> list[SipsStep]:
+    """
+    EDB-first SIPS:
+      1. Bindings from the head adornment
+      2. Positive non-MDB atoms (EDB and non-MDB IDB): bind all their variables
+      3. Safe arithmetic: X = expr(bound) binds X
+      4. Positive MDB atoms: adorned with that bound set, with no bindings
+         passed between them
+      5. Negated MDB atoms and the other MDB atoms of the head
+    """
+    non_mdb_pos, arith_raw, mdb_pos, _ = _classify(list(rule.body), mdb)
+
+    bound = _bound_from(head_args, head_adorn)
+    for _, lit in non_mdb_pos:
+        bound |= _vars(lit)
+    safe_arith, bound = _safe_arith([lit for _, lit in arith_raw], bound)
+    before = [lit for _, lit in non_mdb_pos] + safe_arith
+
+    steps = [
+        SipsStep("pos", i, lit, _adorn(_args(lit.atom), bound), before)
+        for i, lit in mdb_pos
+    ]
+    return steps + _tail_steps(rule, head_idx, mdb, bound, before)
+
+
+def sips_alviano(
+    rule: A.AST, head_idx: int, head_args: list, head_adorn: str, mdb: set,
+    prefer_non_mdb: bool = False,
+) -> list[SipsStep]:
+    """
+    SIPS of the prototype of Alviano et al. (Sec. 4.1):
+      - The positive body atoms (MDB or not) form a chain. At each step the
+        atom with most bound arguments is picked; ties are broken by the
+        original body order.
+      - A positive atom binds its variables only if some argument is bound.
+      - The magic rule of each atom contains the original atoms that precede
+        it in the chain, MDB atoms included.
+      - Negated MDB atoms and the other MDB atoms of the head go last.
+    Safe arithmetic is added as soon as its variables are bound.
+    """
+    body = list(rule.body)
+    _, arith_raw, _, _ = _classify(body, mdb)
+    arith = [lit for _, lit in arith_raw]
+    remaining = [(i, lit) for i, lit in enumerate(body) if _is_pos_sym(lit)]
+
+    bound = _bound_from(head_args, head_adorn)
+    chain: list[A.AST] = []
+    steps: list[SipsStep] = []
+    while remaining:
+        safe_arith, cur = _safe_arith(arith, bound)
+        best = max(
+            remaining,
+            key=lambda it: (
+                _adorn(_args(it[1].atom), cur).count("b"),
+                prefer_non_mdb and _sig(it[1].atom) not in mdb,
+                -it[0],
+            ),
+        )
+        remaining.remove(best)
+        i, lit = best
+        adorn = _adorn(_args(lit.atom), cur)
+        if _sig(lit.atom) in mdb:
+            steps.append(SipsStep("pos", i, lit, adorn, chain + safe_arith))
+        chain.append(lit)
+        if "b" in adorn:
+            bound |= _vars(lit)
+
+    safe_arith, bound = _safe_arith(arith, bound)
+    return steps + _tail_steps(rule, head_idx, mdb, bound, chain + safe_arith)
+
+
+def sips_hybrid(
+    rule: A.AST, head_idx: int, head_args: list, head_adorn: str, mdb: set,
+) -> list[SipsStep]:
+    """
+    Most bound first, as sips_alviano, but ties are broken in favour of
+    non-MDB atoms (EDB and non-MDB IDB) instead of by textual body order, so
+    the rewriting does not depend on how the body happens to be written.
+    """
+    return sips_alviano(rule, head_idx, head_args, head_adorn, mdb,
+                        prefer_non_mdb=True)
+
+
+SIPS: dict[str, Callable[..., list[SipsStep]]] = {
+    "edb": sips_edb,
+    "alviano": sips_alviano,
+    "hybrid": sips_hybrid,
+}
+
+
+# Generate magic rules (Fig. 4)
 
 
 def generate_magic(
-    rule: A.AST,
-    head_name: str,
-    head_args: list,
-    head_adorn: str,
-    head_idx: int,
-    body_adorns: dict,
-    neg_adorns: dict,
-    other_head_adorns: dict,
-    mdb: set,
+    head_name: str, head_args: list, head_adorn: str, steps: list[SipsStep],
 ) -> list[str]:
     """
-    Para cada átomo MDB adornado q^β en el cuerpo, emite:
-        magic_q_β(ligado) :- magic_head_α(ligado), <átomos no-MDB>, <aritmética safe>.
-
-    La aritmética safe se incluye para que las variables ligadas de llamadas
-    recursivas queden ground (e.g. N1 = N-1 para factorial/2).
+    For every MDB atom q^β of the adorned rule, emit:
+        magic_q_β(bound) :- magic_head_α(bound), <literals that precede q>.
     """
+    trigger = _magic_lit(head_name, head_adorn, head_args)
     out: list[str] = []
-    seen: set[str] = set()
-
-    body = list(rule.body)
-    non_mdb_pos, arith_raw, mdb_pos, neg = _classify(body, mdb)
-
-    m_trigger = _magic_lit(head_name, head_adorn, head_args)
-
-    bound_init = _bound_from(head_args, head_adorn)
-    for _, lit in non_mdb_pos:
-        bound_init |= _vars(lit)
-    all_non_mdb = [lit for _, lit in non_mdb_pos]
-    arith_lits = [lit for _, lit in arith_raw]
-    safe_arith, _ = _safe_arith(arith_lits, bound_init)
-
-    def _emit(r: A.AST):
-        s = str(r)
-        if s not in seen:
-            seen.add(s)
-            out.append(s)
-
-    # Átomos MDB positivos en el cuerpo
-    for i, lit in mdb_pos:
-        adorn = body_adorns.get(i)
-        if adorn is None or "b" not in adorn:
-            continue
-        name, _ = _sig(lit.atom)
-        args = _args(lit.atom)
-        m_conseq = _magic_lit(name, adorn, args)
-        _emit(_rule(m_conseq, [m_trigger] + all_non_mdb + safe_arith))
-
-    # Átomos MDB negados en el cuerpo
-    for i, lit in neg:
-        if not _is_neg_sym(lit):
-            continue
-        name, arity = _sig(lit.atom)
-        if (name, arity) not in mdb:
-            continue
-        adorn = neg_adorns.get(i)
-        if adorn is None or "b" not in adorn:
-            continue
-        args = _args(lit.atom)
-        m_conseq = _magic_lit(name, adorn, args)
-        _emit(_rule(m_conseq, [m_trigger]))
-
-    # Cabezas disjuntivas: propagación cruzada entre átomos MDB hermanos
-    if rule.head.ast_type == A.ASTType.Disjunction:
-        all_context = all_non_mdb + safe_arith
-        for j, elem in enumerate(rule.head.elements):
-            lit = elem.literal
-            if j == head_idx or not _is_pos_sym(lit):
-                continue
-            adorn = other_head_adorns.get(j)
-            if not adorn or "b" not in adorn:
-                continue
-            name, _ = _sig(lit.atom)
-            args = _args(lit.atom)
-            m_conseq = _magic_lit(name, adorn, args)
-            _emit(_rule(m_conseq, [m_trigger] + all_context))
-            if "b" in head_adorn:
-                m_main = _magic_lit(head_name, head_adorn, head_args)
-                _emit(_rule(m_main, [m_conseq] + all_context))
-
+    for st in steps:
+        name, _ = _sig(st.lit.atom)
+        m_conseq = _magic_lit(name, st.adorn, _args(st.lit.atom))
+        r = str(_rule(m_conseq, [trigger] + st.before))
+        if r not in out:
+            out.append(r)
     return out
 
 
-# Modificar regla (Fig. 5)
+# Modify rule (Fig. 5)
 
 
 def modify_rule(
@@ -505,104 +658,70 @@ def modify_rule(
     head_args: list,
     head_adorn: str,
     head_idx: int,
-    body_adorns: dict,
-    neg_adorns: dict,
-    other_head_adorns: dict,
-    mdb: set,
+    steps: list[SipsStep],
 ) -> str:
     """
-    Construye la regla modificada:
-      - Cabeza renombrada a pred_adorn
-      - Magic guard(s) antepuestos al cuerpo
-      - Átomos MDB del cuerpo renombrados a su versión adornada
-      - EDB, IDB no-MDB y aritmética copiados sin cambios
-      - Orden original del cuerpo preservado
+    Build the modified rule (Fig. 5): the original, unadorned rule with a magic
+    guard for every adorned head atom.
+
+    Head and body keep the original predicates. Adorning them would split a
+    disjunctive rule into independent disjunctions over different atoms and
+    break minimality (Alviano et al. 2012, Sec. 3.1).
+
+    Anonymous variables in the head are renamed (AnonVarN) so that the magic
+    guard binds them and the rule is safe.
     """
-    body = list(rule.body)
-    non_mdb_pos, arith_raw, mdb_pos, neg = _classify(body, mdb)
+    anon_ctr = [0]
 
-    _anon_ctr = [0]
-    fresh_head_args = [_freshen_anon(a, _anon_ctr) for a in head_args]
+    def fresh_lit(lit: A.AST) -> A.AST:
+        sym = lit.atom.symbol
+        args = [_freshen_anon(a, anon_ctr) for a in sym.arguments]
+        new_sym = A.Function(LOC, sym.name, args, sym.external)
+        return A.Literal(LOC, lit.sign, A.SymbolicAtom(new_sym))
 
-    # Nueva cabeza
     orig_head = rule.head
     if _is_pos_sym(orig_head):
-        sym = orig_head.atom.symbol
-        new_sym = A.Function(LOC, f"{sym.name}_{head_adorn}", fresh_head_args, sym.external)
-        new_head = A.Literal(LOC, orig_head.sign, A.SymbolicAtom(new_sym))
+        new_head = fresh_lit(orig_head)
+        head_lits = [new_head]
     elif orig_head.ast_type == A.ASTType.Disjunction:
-        new_elems = []
-        for j, elem in enumerate(orig_head.elements):
-            lit = elem.literal
-            if j == head_idx:
-                sym = lit.atom.symbol
-                new_sym = A.Function(LOC, f"{sym.name}_{head_adorn}", fresh_head_args, sym.external)
-                new_lit = A.Literal(LOC, lit.sign, A.SymbolicAtom(new_sym))
-            elif _is_pos_sym(lit) and _sig(lit.atom) in mdb and j in other_head_adorns:
-                new_lit = _adorned_lit(lit, other_head_adorns[j])
-            else:
-                new_lit = lit
-            new_elems.append(A.ConditionalLiteral(LOC, new_lit, []))
-        new_head = A.Disjunction(LOC, new_elems)
+        head_lits = [
+            fresh_lit(e.literal) if _is_pos_sym(e.literal) else e.literal
+            for e in orig_head.elements
+        ]
+        new_head = A.Disjunction(
+            LOC, [A.ConditionalLiteral(LOC, l, []) for l in head_lits]
+        )
     else:
         new_head = orig_head
+        head_lits = []
 
-    # Magic guard(s)
-    guards = [_magic_lit(head_name, head_adorn, fresh_head_args)]
-    if orig_head.ast_type == A.ASTType.Disjunction:
-        for j, elem in enumerate(orig_head.elements):
-            lit = elem.literal
-            if j == head_idx or not _is_pos_sym(lit):
-                continue
-            adorn = other_head_adorns.get(j)
-            if adorn and "b" in adorn:
-                name, _ = _sig(lit.atom)
-                args = _args(lit.atom)
-                guards.append(_magic_lit(name, adorn, args))
+    guards = [_magic_lit(head_name, head_adorn,
+                         _args(head_lits[head_idx].atom) if head_lits else head_args)]
+    for st in steps:
+        if st.kind == "head":
+            name, _ = _sig(st.lit.atom)
+            guards.append(_magic_lit(name, st.adorn, _args(head_lits[st.idx].atom)))
 
-    # Nuevo cuerpo: renombrar átomos MDB, copiar todo lo demás
-    mdb_pos_idx = {i for i, _ in mdb_pos}
-    neg_mdb_idx = {
-        i
-        for i, lit in neg
-        if _is_neg_sym(lit) and _sig(lit.atom) in mdb
-    }
-    new_body: list[A.AST] = []
-    for i, lit in enumerate(body):
-        if i in mdb_pos_idx:
-            adorn = body_adorns.get(i, "f" * len(_args(lit.atom)))
-            if "b" in adorn:
-                new_body.append(_adorned_lit(lit, adorn))
-            else:
-                new_body.append(lit)
-        elif i in neg_mdb_idx:
-            adorn = neg_adorns.get(i, "f" * len(_args(lit.atom)))
-            if "b" in adorn:
-                new_body.append(_adorned_lit(lit, adorn))
-            else:
-                new_body.append(lit)
-        else:
-            new_body.append(lit)
-
-    return str(_rule(new_head, guards + new_body))
+    return str(_rule(new_head, guards + list(rule.body)))
 
 
-# Transformador DMS
+# DMS transformer
 
 
 class DMSTransformer:
     """
-    Realiza la transformación DMS completa.
+    Performs the complete DMS transformation.
 
-    Las directivas #magic pred/n declaran el MDB, el subconjunto del IDB
-    que se transforma. Se verifica nombre y aridad, por lo que #magic f/1
-    no afecta a f/2.
+    The #magic pred/n directives declare the MDB, the subset of the IDB that
+    is rewritten. Name and arity are both checked, so #magic f/1 does not
+    affect f/2.
     """
 
-    def __init__(self):
-        self.mdb: set[tuple[str, int]] = set()   # predicados MDB (via #magic)
-        self.mdb_rules: list[A.AST] = []          # reglas IDB con cabeza MDB
-        self._all_rules: list[A.AST] = []         # todas las reglas (para estratificación)
+    def __init__(self, sips: str = "edb"):
+        self.sips = SIPS[sips]
+        self.mdb: set[tuple[str, int]] = set()   # MDB predicates (via #magic)
+        self.mdb_rules: list[A.AST] = []          # IDB rules with an MDB head
+        self._all_rules: list[A.AST] = []         # all rules (for stratification)
         self.edb_stmts: list[str] = []
         self.query_stmts: list[str] = []
         self.other_stmts: list[str] = []
@@ -615,7 +734,6 @@ class DMSTransformer:
         self.modified_out: list[str] = []
         self._seen_magic: set[str] = set()
         self._seen_modified: set[str] = set()
-        self._deadorn: set[tuple[str, str, int]] = set()
 
     def _add_magic(self, s: str):
         if s not in self._seen_magic:
@@ -645,8 +763,10 @@ class DMSTransformer:
         A.parse_string(clean, collect)
 
         self._all_rules = all_rules
+        _check_unsupported(all_rules, passthrough, self.mdb)
+        _check_free_calls(all_rules, passthrough, self.mdb)
 
-        # Clasificar reglas en MDB (cabeza MDB), EDB (hechos) e IDB no-MDB
+        # Classify rules as MDB (MDB head), EDB (facts) and non-MDB IDB
         idb_non_mdb: list[A.AST] = []
         for rule in all_rules:
             if _mdb_heads(rule, self.mdb):
@@ -659,10 +779,10 @@ class DMSTransformer:
         for stm in passthrough:
             self.other_stmts.append(str(stm))
 
-        # Seeds: toda regla IDB no-MDB que llame directamente a un predicado MDB
-        # contribuye una seed usando solo los átomos no-MDB de ese mismo cuerpo
-        # como contexto de binding. No se propagan bindings a través de cadenas
-        # de predicados IDB intermedios.
+        # Seeds: every non-MDB IDB rule that directly calls an MDB predicate
+        # contributes a seed, using only the non-MDB atoms of that same body as
+        # binding context. Bindings are not propagated through chains of
+        # intermediate IDB predicates.
         for rule in idb_non_mdb:
             seeds = self._extract_seeds(rule)
             if seeds:
@@ -673,10 +793,10 @@ class DMSTransformer:
 
     def _extract_seeds(self, rule: A.AST) -> list:
         """
-        Extrae (pred, args, adorn, conds) para cada llamada MDB directa en el cuerpo.
+        Extract (pred, args, adorn, conds) for every direct MDB call in the body.
 
-        'conds' son los literales no-MDB positivos del mismo cuerpo que proveen
-        bindings (usados para construir la magic seed rule).
+        'conds' are the positive non-MDB literals of the same body that provide
+        bindings (used to build the magic seed rule).
         """
         body = list(rule.body)
         non_mdb_lits = [
@@ -707,7 +827,13 @@ class DMSTransformer:
             print(w, file=sys.stderr)
 
         if not self.query_seeds:
-            return text
+            # No call with a bound argument: nothing to restrict. Return the
+            # program unchanged but without the #magic directives, which
+            # clingo does not accept.
+            print("warning: no MDB call with a bound argument, no seed was "
+                  "generated; the program is returned without #magic and is "
+                  "not restricted.", file=sys.stderr)
+            return strip_magic(text)
 
         for pred, args, adorn, conds in self.query_seeds:
             m_lit = _magic_lit(pred, adorn, args)
@@ -733,21 +859,16 @@ class DMSTransformer:
                     continue
 
                 for head_idx, head_name, head_args in matching:
-                    b_adorns, n_adorns, o_adorns = adorn_rule(
-                        rule, head_name, head_args, adorn,
-                        head_idx, self.mdb, self.S, self.D,
-                    )
-                    for ms in generate_magic(
-                        rule, head_name, head_args, adorn,
-                        head_idx, b_adorns, n_adorns, o_adorns, self.mdb,
-                    ):
+                    steps = self.sips(rule, head_idx, head_args, adorn, self.mdb)
+                    for st in steps:
+                        ap = (_sig(st.lit.atom)[0], st.adorn)
+                        if ap not in self.D and ap not in self.S:
+                            self.S.append(ap)
+                    for ms in generate_magic(head_name, head_args, adorn, steps):
                         self._add_magic(ms)
-
                     self._add_modified(modify_rule(
-                        rule, head_name, head_args, adorn,
-                        head_idx, b_adorns, n_adorns, o_adorns, self.mdb,
+                        rule, head_name, head_args, adorn, head_idx, steps,
                     ))
-                    self._deadorn.add((pred, adorn, len(head_args)))
 
         return self._build_output()
 
@@ -759,30 +880,21 @@ class DMSTransformer:
             out.extend(self.edb_stmts)
             out.append("")
 
-        out.append("% -- Magic seed y reglas mágicas ----------")
+        out.append("% -- Magic seeds and magic rules --------")
         out.extend(self.magic_out)
         out.append("")
 
-        out.append("% -- Reglas MDB modificadas ---------------")
+        out.append("% -- Modified MDB rules -----------------")
         out.extend(self.modified_out)
         out.append("")
 
-        if self._deadorn:
-            out.append("% -- De-adornado --------------------------")
-            for pred, adorn, arity in sorted(self._deadorn):
-                vs = [A.Variable(LOC, f"V{i}") for i in range(arity)]
-                orig_head = _pos_lit(pred, vs)
-                adorned_body = _pos_lit(f"{pred}_{adorn}", vs)
-                out.append(str(_rule(orig_head, [adorned_body])))
-            out.append("")
-
         if self.query_stmts:
-            out.append("% -- Reglas IDB no-MDB (callers) ----------")
+            out.append("% -- Non-MDB IDB rules (callers) --------")
             out.extend(self.query_stmts)
             out.append("")
 
         if self.other_stmts:
-            out.append("% -- Directivas --------------------------")
+            out.append("% -- Directives -------------------------")
             out.extend(self.other_stmts)
             out.append("")
 
@@ -793,15 +905,24 @@ class DMSTransformer:
 
 
 def main():
-    if len(sys.argv) < 2:
-        print("Uso: python dms.py input.lp [output.lp]")
-        return
-    with open(sys.argv[1]) as f:
+    import argparse
+
+    ap = argparse.ArgumentParser(description="Dynamic Magic Sets transformation")
+    ap.add_argument("input")
+    ap.add_argument("output", nargs="?")
+    ap.add_argument("--sips", choices=sorted(SIPS), default="edb")
+    args = ap.parse_args()
+
+    with open(args.input, encoding="utf-8") as f:
         text = f.read()
-    result = DMSTransformer().transform(text)
+    try:
+        result = DMSTransformer(args.sips).transform(text)
+    except UnsupportedMDBUse as e:
+        print(f"error: {e}", file=sys.stderr)
+        sys.exit(1)
     print(result)
-    if len(sys.argv) > 2:
-        with open(sys.argv[2], "w") as f:
+    if args.output:
+        with open(args.output, "w", encoding="utf-8") as f:
             f.write(result)
 
 

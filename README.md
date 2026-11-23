@@ -27,7 +27,7 @@ pip install -r requirements.txt
 ## Usage
 
 ```bash
-python dms.py input.lp [output.lp]
+python dms.py [--sips {edb,alviano,hybrid}] input.lp [output.lp]
 ```
 
 If no output file is given, the transformed program is written to `stdout`. The
@@ -37,6 +37,17 @@ result is a standard ASP program that can be passed directly to Clingo:
 python dms.py examples/reach.lp reach_dms.lp
 clingo reach_dms.lp
 ```
+
+The `--sips` option selects the sideways information passing strategy: `edb`
+(default) binds non-MDB atoms before MDB atoms and passes no bindings between
+MDB atoms; `alviano` is the *most bound first* strategy of Alviano et al.
+(ties broken by textual order), whose magic rules may contain MDB atoms;
+`hybrid` is like `alviano` but breaks ties in favour of non-MDB atoms.
+
+Programs that the rewriting cannot handle correctly (an MDB atom inside an
+aggregate, a conditional literal or `#minimize`, or an all-free call to an MDB
+predicate from a rule that defines the output) are rejected with an error
+instead of being silently rewritten.
 
 ### Shortcut: `dms-solve.sh`
 
